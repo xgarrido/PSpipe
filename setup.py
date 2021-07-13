@@ -1,6 +1,5 @@
-from setuptools import find_packages, setup
-
 import versioneer
+from setuptools import find_packages, setup
 
 with open("README.rst") as readme_file:
     readme = readme_file.read()
@@ -17,12 +16,16 @@ setup(
     python_requires=">=3.5",
     zip_safe=True,
     packages=find_packages(),
-    install_requires=[
-        "scipy",
-        "camb",
-        "pspy>=1.2.1",
-        "pymaster>=1.0.2",
-        "mflike @ git+https://github.com/simonsobs/LAT_MFLike@master#egg=mflike",
-        "wget",
-    ],
+    # install_requires=[
+    #     "scipy",
+    #     "camb",
+    #     "pspy>=1.2.1",
+    #     "pymaster>=1.0.2",
+    #     "simple-slurm",
+    #     "mflike @ git+https://github.com/simonsobs/LAT_MFLike@master#egg=mflike",
+    #     "wget",
+    # ],
+    entry_points={
+        "console_scripts": ["pspipe=pspipe.run:main"],
+    },
 )

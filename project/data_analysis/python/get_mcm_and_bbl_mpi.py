@@ -1,74 +1,76 @@
-"""
-This script computes the mode coupling matrices and the binning matrices Bbl
-for the different surveys and arrays.
-"""
+# This script computes the mode coupling matrices and the binning matrices Bbl
+# for the different surveys and arrays.
 
-from pspy import so_map, so_mcm, pspy_utils, so_dict, so_mpi
+import logging
+import os
 import sys
+from itertools import combinations_with_replacement as cwr
+from itertools import product
 
-d = so_dict.so_dict()
-d.read_from_file(sys.argv[1])
+import numpy as np
+import yaml
+from pspy import pspy_utils, so_map, so_mcm, so_mpi, sph_tools
 
-mcm_dir = "mcms"
-pspy_utils.create_directory(mcm_dir)
+d = yaml.safe_load(open(sys.argv[1]))
 
-surveys = d["surveys"]
-lmax = d["lmax"]
+logging.basicConfig(
+    format="%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s: %(message)s",
+    datefmt="%d-%b-%y %H:%M:%S",
+    level=logging.DEBUG if d.get("debug", False) else logging.INFO,
+)
 
-if d["use_toeplitz"] == True:
-    print("we will use the toeplitz approximation")
-    l_exact, l_band, l_toep = 800, 2000, 2750
-else:
-    l_exact, l_band, l_toep = None, None, None
+data_dir = d["data_dir"]
+product_dir = d["product_dir"]
+windows_dir = os.path.join(product_dir, "windows")
+mcms_dir = os.path.join(product_dir, "mcms")
+os.makedirs(mcms_dir, exist_ok=True)
+sq_win_alms_dir = os.path.join(product_dir, "sq_win_alms")
+os.makedirs(sq_win_alms_dir, exist_ok=True)
 
+l_exact, l_band, l_toep = None, None, None
+if d.get("use_toeplitz_mcm", False):
+    l_exact, l_band, l_toep = d.get("l_exact", 800), d.get("l_band", 2000), d.get("l_toep", 2750)
+    logging.info(
+        "Use the toeplitz approximation with the following parameters: "
+        f"l_exact={l_exact}, l_band={l_band}, l_toep={l_toep}"
+    )
 
-sv1_list, ar1_list, sv2_list, ar2_list = [], [], [], []
-n_mcms = 0
-for id_sv1, sv1 in enumerate(surveys):
-    arrays_1 = d["arrays_%s" % sv1]
-    for id_ar1, ar1 in enumerate(arrays_1):
-        for id_sv2, sv2 in enumerate(surveys):
-            arrays_2 = d["arrays_%s" % sv2]
-            for id_ar2, ar2 in enumerate(arrays_2):
-                # This ensures that we do not repeat redundant computations
-                if  (id_sv1 == id_sv2) & (id_ar1 > id_ar2) : continue
-                if  (id_sv1 > id_sv2) : continue
-                sv1_list += [sv1]
-                ar1_list += [ar1]
-                sv2_list += [sv2]
-                ar2_list += [ar2]
-                n_mcms += 1
-                
-print("number of mcm matrices to compute : %s" % n_mcms)
+surveys = d.get("surveys")
+svxar = [(sv, ar) for sv in d.get("selected_surveys") for ar in surveys.get(sv).get("arrays")]
+comb = [c1 + c2 for c1, c2 in cwr(svxar, 2)]
+
+logging.info(f"Number of mcm matrices to compute : {len(comb)}")
 so_mpi.init(True)
-subtasks = so_mpi.taskrange(imin=0, imax=n_mcms - 1)
-print(subtasks)
+subtasks = so_mpi.taskrange(imin=0, imax=len(comb) - 1)
 for task in subtasks:
     task = int(task)
-    sv1, ar1, sv2, ar2 = sv1_list[task], ar1_list[task], sv2_list[task], ar2_list[task]
-    
-    print("%s_%s x %s_%s" % (sv1, ar1, sv2, ar2))
-    
-    l, bl1 = pspy_utils.read_beam_file(d["beam_%s_%s" % (sv1, ar1)])
-    win1_T = so_map.read_map(d["window_T_%s_%s" % (sv1, ar1)])
-    win1_pol = so_map.read_map(d["window_pol_%s_%s" % (sv1, ar1)])
-    
-    l, bl2 = pspy_utils.read_beam_file(d["beam_%s_%s" % (sv2, ar2)])
-    win2_T = so_map.read_map(d["window_T_%s_%s" % (sv2, ar2)])
-    win2_pol = so_map.read_map(d["window_pol_%s_%s" % (sv2, ar2)])
+    sv1, ar1, sv2, ar2 = comb[task]
+    logging.debug(f"[{task:>3}] Compute mcm for {sv1}_{ar1}x{sv2}_{ar2}...")
 
-    mbb_inv, Bbl = so_mcm.mcm_and_bbl_spin0and2(win1=(win1_T, win1_pol),
-                                                win2=(win2_T, win2_pol),
-                                                bl1=(bl1, bl1),
-                                                bl2=(bl2, bl2),
-                                                binning_file=d["binning_file"],
-                                                niter=d["niter"],
-                                                lmax=d["lmax"],
-                                                type=d["type"],
-                                                l_exact=l_exact,
-                                                l_band=l_band,
-                                                l_toep=l_toep,
-                                                save_file="%s/%s_%sx%s_%s"%(mcm_dir, sv1, ar1, sv2, ar2))
+    survey1, survey2 = surveys.get(sv1), surveys.get(sv2)
+    ell, bl1 = pspy_utils.read_beam_file(os.path.join(data_dir, survey1.get("beams").get(ar1)))
+    win1 = so_map.read_map(os.path.join(windows_dir, f"window_{sv1}_{ar1}.fits"))
+    ell, bl2 = pspy_utils.read_beam_file(os.path.join(data_dir, survey2.get("beams").get(ar2)))
+    win2 = so_map.read_map(os.path.join(windows_dir, f"window_{sv2}_{ar2}.fits"))
 
+    # Make no difference between temperature/polarization windows
+    mbb_inv, Bbl = so_mcm.mcm_and_bbl_spin0and2(
+        win1=(win1, win1),
+        win2=(win2, win2),
+        bl1=(bl1, bl1),
+        bl2=(bl2, bl2),
+        binning_file=os.path.join(data_dir, d.get("binning_file")),
+        niter=d.get("niter", 0),
+        lmax=d.get("lmax", 7930),
+        type=d.get("type", "Dl"),
+        l_exact=l_exact,
+        l_band=l_band,
+        l_toep=l_toep,
+        save_file=os.path.join(mcms_dir, f"{sv1}_{ar1}x{sv2}_{ar2}"),
+    )
 
-
+    # This was initially done in fast_cov_get_sq_windows_alms
+    sq_win = win1.copy()
+    sq_win.data *= win2.data
+    sqwin_alm = sph_tools.map2alm(sq_win, niter=d.get("niter", 0), lmax=d.get("lmax"))
+    np.save(os.path.join(sq_win_alms_dir, f"alms_{sv1}_{ar1}x{sv2}_{ar2}.npy"), sqwin_alm)

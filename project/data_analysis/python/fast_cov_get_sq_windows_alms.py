@@ -1,44 +1,37 @@
-"""
-This script compute all alms squared windows, it's a necessary step of covariance computation.
-"""
-from pspy import so_dict, so_map, sph_tools, so_spectra, pspy_utils, so_mpi
-import numpy as np
+# This script compute all alms squared windows, it's a necessary step of covariance computation.
+
+import logging
+import os
 import sys
+from itertools import combinations_with_replacement as cwr
+from itertools import product
 
-d = so_dict.so_dict()
-d.read_from_file(sys.argv[1])
+import yaml
+from pspy import pspy_utils, so_map, so_mpi, sph_tools
 
-surveys = d["surveys"]
-lmax = d["lmax"]
-niter = d["niter"]
-sq_win_alms_dir = "sq_win_alms"
+d = yaml.safe_load(open(sys.argv[1]))
 
-pspy_utils.create_directory(sq_win_alms_dir)
+logging.basicConfig(
+    format="%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s: %(message)s",
+    datefmt="%d-%b-%y %H:%M:%S",
+    level=logging.DEBUG if d.get("debug", False) else logging.INFO,
+)
 
-sv1_list, ar1_list, sv2_list, ar2_list = [], [], [], []
-n_alms = 0
-for id_sv1, sv1 in enumerate(surveys):
-    arrays_1 = d["arrays_%s" % sv1]
-    for id_ar1, ar1 in enumerate(arrays_1):
-        for id_sv2, sv2 in enumerate(surveys):
-            arrays_2 = d["arrays_%s" % sv2]
-            for id_ar2, ar2 in enumerate(arrays_2):
-                # This ensures that we do not repeat redundant computations
-                if  (id_sv1 == id_sv2) & (id_ar1 > id_ar2) : continue
-                if  (id_sv1 > id_sv2) : continue
-                sv1_list += [sv1]
-                ar1_list += [ar1]
-                sv2_list += [sv2]
-                ar2_list += [ar2]
-                n_alms += 1
+product_dir = d["product_dir"]
+windows_dir = os.path.join(product_dir, "windows")
+sq_win_alms_dir = os.path.join(product_dir, "sq_win_alms")
+os.makedirs(sq_win_alms_dir, exist_ok=True)
 
-print("number of sq win alms to compute : %s" % n_alms)
+surveys = d.get("surveys")
+svxar = [(k, ar) for k, v in surveys.items() for ar in v.get("arrays")]
+comb = [c1 + c2 for c1, c2 in cwr(svxar, 2)]
+
+logging.info(f"Number of sq win alms to compute : {len(comb)}")
 so_mpi.init(True)
-subtasks = so_mpi.taskrange(imin=0, imax=n_alms - 1)
-print(subtasks)
+subtasks = so_mpi.taskrange(imin=0, imax=len(comb) - 1)
 for task in subtasks:
     task = int(task)
-    sv1, ar1, sv2, ar2 = sv1_list[task], ar1_list[task], sv2_list[task], ar2_list[task]
+    sv1, ar1, sv2, ar2 = comb[task]
 
     win_T1 = so_map.read_map(d["window_T_%s_%s" % (sv1, ar1)])
     win_T2 = so_map.read_map(d["window_T_%s_%s" % (sv2, ar2)])
@@ -46,6 +39,5 @@ for task in subtasks:
     sq_win = win_T1.copy()
     sq_win.data[:] *= win_T2.data[:]
     sqwin_alm = sph_tools.map2alm(sq_win, niter=niter, lmax=lmax)
-    
-    np.save("%s/alms_%s_%sx%s_%s.npy" % (sq_win_alms_dir, sv1, ar1, sv2, ar2), sqwin_alm)
 
+    np.save("%s/alms_%s_%sx%s_%s.npy" % (sq_win_alms_dir, sv1, ar1, sv2, ar2), sqwin_alm)

@@ -1,81 +1,67 @@
-import matplotlib
-matplotlib.use("Agg")
-import numpy as np
-import pylab as plt
-from pspy import so_dict, so_spectra, pspy_utils
+import logging
+import os
 import sys
-import scipy.interpolate
+from itertools import combinations_with_replacement as cwr
 
-d = so_dict.so_dict()
-d.read_from_file(sys.argv[1])
+import numpy as np
+import yaml
+from pspy import pspy_utils, so_spectra
+from scipy.interpolate import interp1d
 
-spectra_dir = "spectra"
-ps_model_dir = "noise_model"
-plot_dir = "plots/noise_model/"
+d = yaml.safe_load(open(sys.argv[1]))
 
-pspy_utils.create_directory(ps_model_dir)
-pspy_utils.create_directory(plot_dir)
+logging.basicConfig(
+    format="%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s: %(message)s",
+    datefmt="%d-%b-%y %H:%M:%S",
+    level=logging.DEBUG if d.get("debug", False) else logging.INFO,
+)
+data_dir = d["data_dir"]
+product_dir = d["product_dir"]
+spectra_dir = os.path.join(product_dir, "spectra")
+ps_model_dir = os.path.join(product_dir, "noise_model")
+os.makedirs(ps_model_dir, exist_ok=True)
 
-spectra = ["TT", "TE", "TB", "ET", "BT", "EE", "EB", "BE", "BB"]
+spectra = d.get("spectra", ["TT", "TE", "TB", "ET", "BT", "EE", "EB", "BE", "BB"])
 surveys = d["surveys"]
 lmax = d["lmax"]
-type = d["type"]
-binning_file = d["binning_file"]
+cl_type = d["type"]
+binning_file = os.path.join(data_dir, d.get("binning_file"))
 
-lth = np.arange(2, lmax+2)
+lth = np.arange(2, lmax + 2)
 
-for sv in surveys:
-    arrays = d["arrays_%s" % sv]
-    for id_ar1, ar1 in enumerate(arrays):
-        for id_ar2, ar2 in enumerate(arrays):
-            if id_ar1 > id_ar2: continue
-            l, bl_ar1 = pspy_utils.read_beam_file(d["beam_%s_%s" % (sv, ar1)])
-            l, bl_ar2 = pspy_utils.read_beam_file(d["beam_%s_%s" % (sv, ar2)])
+for sv in d.get("selected_surveys"):
+    survey = surveys.get(sv)
+    for ar1, ar2 in cwr(survey.get("arrays"), 2):
+        beams = survey.get("beams")
+        ell, bl_ar1 = pspy_utils.read_beam_file(os.path.join(data_dir, beams.get(ar1)))
+        ell, bl_ar2 = pspy_utils.read_beam_file(os.path.join(data_dir, beams.get(ar2)))
 
+        lb, bb_ar1 = pspy_utils.naive_binning(ell, bl_ar1, binning_file, lmax)
+        lb, bb_ar2 = pspy_utils.naive_binning(ell, bl_ar2, binning_file, lmax)
 
-            lb, bb_ar1 = pspy_utils.naive_binning(l, bl_ar1, binning_file, lmax)
-            lb, bb_ar2 = pspy_utils.naive_binning(l, bl_ar2, binning_file, lmax)
+        spec_name_noise = f"{cl_type}_{sv}_{ar1}x{sv}_{ar2}_noise"
+        logging.debug(f"Reading {spec_name_noise} spectra")
+        lb, nbs = so_spectra.read_ps(
+            os.path.join(spectra_dir, f"{spec_name_noise}.dat"), spectra=spectra
+        )
 
-            nsplits = len(d["maps_%s_%s" % (sv, ar1)])
-        
-            spec_name_noise = "%s_%s_%sx%s_%s_noise" % (type, sv, ar1, sv, ar2)
-            print(spec_name_noise)
-            lb, nbs = so_spectra.read_ps("%s/%s.dat" % (spectra_dir, spec_name_noise), spectra=spectra)
-        
-            nl_dict = {}
-            for spec in spectra:
-                nbs_mean = nbs[spec] * bb_ar1*bb_ar2
-                plt.figure(figsize=(12,12))
+        nl_dict = {}
+        for spec in spectra:
+            nbs_mean = nbs[spec] * bb_ar1 * bb_ar2
 
-                if (spec == "TT" or spec == "EE" or spec == "BB") & (ar1 == ar2):
-                
-                    nl = scipy.interpolate.interp1d(lb, nbs_mean, fill_value = "extrapolate")
-                    nl_dict[spec] = np.array([nl(i) for i in lth])
-                    id = np.where(lth <= np.min(lb))
-                    nl_dict[spec][id]= nbs_mean[0]
-                    nl_dict[spec] = np.abs(nl_dict[spec])
-                    
-                    plt.semilogy()
-                    
-                    plt.plot(lth,
-                             nl_dict[spec],
-                             label="interpolate",
-                             color="lightblue")
+            if spec in ["TT", "EE", "BB"] and ar1 == ar2:
+                nl = interp1d(lb, nbs_mean, fill_value="extrapolate")
+                nl_dict[spec] = np.array([nl(i) for i in lth])
+                idx = np.where(lth <= np.min(lb))
+                nl_dict[spec][idx] = nbs_mean[0]
+                nl_dict[spec] = np.abs(nl_dict[spec])
+            else:
+                nl_dict[spec] = np.zeros(len(lth))
 
-                else:
-                    nl_dict[spec] = np.zeros(len(lth))
-                
-                plt.plot(lb,
-                         nbs_mean,
-                         ".",
-                         label = "%s %sx%s" % (sv, ar1, ar2),
-                        color="red")
-                
-                plt.legend(fontsize=20)
-                plt.savefig("%s/noise_interpolate_%sx%s_%s_%s.png" % (plot_dir, ar1, ar2, sv, spec), bbox_inches="tight")
-                plt.clf()
-                plt.close()
-
-            spec_name_noise_mean = "mean_%sx%s_%s_noise" % (ar1, ar2, sv)
-
-            so_spectra.write_ps(ps_model_dir + "/%s.dat" % spec_name_noise_mean, lth, nl_dict, type, spectra=spectra)
+        so_spectra.write_ps(
+            os.path.join(ps_model_dir, f"mean_{ar1}x{ar2}_{sv}_noise.dat"),
+            lth,
+            nl_dict,
+            cl_type,
+            spectra=spectra,
+        )

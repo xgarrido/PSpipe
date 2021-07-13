@@ -1,89 +1,93 @@
-"""
-This script compute best fit from theory and fg power spectra.
-It uses camb and the foreground model of mflike based on fgspectra
-"""
-import matplotlib
-matplotlib.use("Agg")
+#
+# This script compute best fit from theory and fg power spectra.
+# It uses camb and the foreground model of mflike based on fgspectra
+#
+import logging
+import os
 import sys
+from itertools import product
 
 import numpy as np
-import pylab as plt
-from pspy import pspy_utils, so_dict
+import yaml
 
-d = so_dict.so_dict()
-d.read_from_file(sys.argv[1])
+d = yaml.safe_load(open(sys.argv[1]))
 
-# first let's get a list of all frequency we plan to study
-surveys = d["surveys"]
-lmax = d["lmax"]
+logging.basicConfig(
+    format="%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s: %(message)s",
+    datefmt="%d-%b-%y %H:%M:%S",
+    level=logging.DEBUG if d.get("debug", False) else logging.INFO,
+)
 
-freq_list = []
-for sv in surveys:
-    arrays = d["arrays_%s" % sv]
-    for ar in arrays:
-        freq_list += [d["nu_eff_%s_%s" % (sv, ar)]]
+data_dir = d["data_dir"]
+product_dir = d["product_dir"]
+best_fits_dir = os.path.join(product_dir, "best_fits")
+os.makedirs(best_fits_dir, exist_ok=True)
 
-# remove doublons
-freq_list = list(dict.fromkeys(freq_list))
+frequencies = sorted(
+    {
+        freq
+        for sv in d.get("selected_surveys")
+        for freq in d.get("surveys").get(sv).get("frequencies").values()
+    }
+)
+logging.debug(f"Frequencies: {frequencies} GHz")
 
-# let's create the directories to write best fit to disk and for plotting purpose
-bestfit_dir = "best_fits"
-plot_dir = "plots/best_fits/"
-
-pspy_utils.create_directory(bestfit_dir)
-pspy_utils.create_directory(plot_dir)
-
-# now we use camb to produce best fit power spectrum, we will use CAMB to do so with standard LCDM params
+# Now we use camb to produce best fit power spectrum, we will use CAMB to do so with standard LCDM
+# params
 import camb
-ell_min, ell_max = 2, lmax + 500
-cosmo_params = d["cosmo_params"]
+
+ell_min, ell_max = 2, d.get("lmax") + 500
+bf_parameters = d.get("best_fit_parameters")
+cosmo_params = bf_parameters.get("cosmo_params")
 camb_cosmo = {k: v for k, v in cosmo_params.items() if k not in ["logA", "As"]}
-camb_cosmo.update({"As": 1e-10*np.exp(cosmo_params["logA"]), "lmax": ell_max, "lens_potential_accuracy": 1})
+camb_cosmo.update(
+    {"As": 1e-10 * np.exp(cosmo_params["logA"]), "lmax": ell_max, "lens_potential_accuracy": 1}
+)
+logging.debug(f"Generating CAMB simulations with the following parameters: {camb_cosmo}")
 pars = camb.set_params(**camb_cosmo)
 results = camb.get_results(pars)
 powers = results.get_cmb_power_spectra(pars, CMB_unit="muK")
-clth = {}
-for count, spec in enumerate(["TT", "EE", "BB", "TE" ]):
-    clth[spec] = powers["total"][ell_min:ell_max][:,count]
+
+clth = {
+    spec: powers["total"][ell_min:ell_max][:, i] for i, spec in enumerate(["TT", "EE", "BB", "TE"])
+}
 clth["ET"] = clth["TE"]
-for spec in ["TB", "BT", "EB", "BE" ]:
-    clth[spec] = clth["TT"] * 0
-    
+clth.update({spec: np.zeros_like(clth["TT"]) for spec in ["TB", "BT", "EB", "BE"]})
+logging.debug(f"Simulated power spectra {clth}")
+
 ell = np.arange(ell_min, ell_max)
-np.savetxt("%s/lcdm.dat" % bestfit_dir, np.transpose([ell, clth["TT"], clth["EE"], clth["BB"], clth["TE"]]))
-    
-# we will now use mflike (and in particular the fg module) to get the best fit foreground model
-# we will only include foreground in tt, note that for now only extragalactic foreground are present
-import mflike as mfl
+np.savetxt(
+    os.path.join(best_fits_dir, "lcdm.dat"),
+    np.transpose([ell, clth["TT"], clth["EE"], clth["BB"], clth["TE"]]),
+)
 
-fg_norm = d["fg_norm"]
-fg_components =  d["fg_components"]
-components = {"tt": fg_components, "ee": [], "te": []}
-fg_model =  {"normalisation":  fg_norm, "components": components}
-fg_params = d["fg_params"]
-fg_dict = mfl.get_foreground_model(fg_params, fg_model, freq_list, ell)
+# We will now use mflike (and in particular the fg module) to get the best fit foreground model
+# We will only include foreground in tt, note that for now only extragalactic foreground are present
+import mflike
 
-spectra = ["TT", "TE", "TB", "ET", "BT", "EE", "EB", "BE", "BB"]
+fg_config = bf_parameters.get("foregrounds")
+fg_dict = mflike.get_foreground_model(
+    fg_params=fg_config.get("params"),
+    fg_model=dict(
+        normalisation=fg_config.get("norm"),
+        components=dict(tt=fg_config.get("components"), ee=[], te=[]),
+    ),
+    frequencies=frequencies,
+    ell=ell,
+)
 
-for spec in spectra:
-    plt.figure(figsize=(12,12))
-    for freq1 in freq_list:
-        for freq2 in freq_list:
-            name = "%sx%s_%s" % (freq1, freq2, spec)
-            cl_th_and_fg = clth[spec]
+spectra = d.get("spectra", ["TT", "TE", "TB", "ET", "BT", "EE", "EB", "BE", "BB"])
+for spec, freq1, freq2 in product(spectra, frequencies, frequencies):
+    name = f"{freq1}x{freq2}_{spec}"
+    cl_th_and_fg = clth[spec]
 
-            if spec == "TT":
-                plt.semilogy()
-                cl_th_and_fg = cl_th_and_fg + fg_dict["tt", "all", freq1, freq2]
-                np.savetxt("%s/fg_%s.dat" % (bestfit_dir, name),
-                                    np.transpose([ell, fg_dict["tt", "all", freq1, freq2]]))
+    if spec == "TT":
+        cl_th_and_fg += fg_dict["tt", "all", freq1, freq2]
+        np.savetxt(
+            os.path.join(best_fits_dir, f"fg_{name}.dat"),
+            np.transpose([ell, fg_dict["tt", "all", freq1, freq2]]),
+        )
 
-                    
-            np.savetxt("%s/best_fit_%s.dat" % (bestfit_dir, name),
-                                np.transpose([ell, cl_th_and_fg]))
-
-            plt.plot(ell, cl_th_and_fg, label= "%s x %s" %(freq1, freq2) )
-    plt.legend()
-    plt.savefig("%s/best_fit_%s.png" % (plot_dir, spec))
-    plt.clf()
-    plt.close()
+    np.savetxt(
+        os.path.join(best_fits_dir, f"best_fit_{name}.dat"), np.transpose([ell, cl_th_and_fg])
+    )
